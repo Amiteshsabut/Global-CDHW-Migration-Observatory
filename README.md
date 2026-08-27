@@ -1,20 +1,45 @@
 # Global Compound Drought–Heatwave Migration Observatory
 
-This repository is configured so that **GitHub itself preprocesses the GeoTIFFs and deploys the dashboard**. You do not need to run the preprocessing script on your computer.
+An interactive web dashboard for exploring the spatial evolution of observed compound drought–heatwave (CDHW) migration events worldwide during 1982–2019.
 
-## Dashboard comparison
+The dashboard compares two equal observational periods, **1982–2000** and **2001–2019**, and provides interactive views of migration trajectories, migration-track density, and changes in spatial occurrence.
 
-- **Early period:** 1982–2000
-- **Recent period:** 2001–2019
-- **Change:** 2001–2019 minus 1982–2000
+## Dashboard
 
-The dashboard provides a draggable period-comparison map, a recent-minus-early change map, annual 1982–2019 trend, population/cropland/pasture context layers, opacity controls, continent zooms, and grid-cell inspection.
+The interactive interface provides three complementary views:
 
-## Put your data in these three folders
+- **Tracks** — observed CDHW migration trajectories reconstructed from daily event locations.
+- **Density** — cumulative migration-track occurrence during 1982–2000 and 2001–2019.
+- **Change** — spatial difference in migration-track occurrence between the recent and early periods.
 
-### `raw_data/migration/`
+A draggable map divider enables direct comparison between the two observational periods.
 
-Copy:
+## Data
+
+The dashboard is based on observed CDHW event tracking for 1982–2019.
+
+### Migration Trajectories
+
+Daily event trajectories are derived from:
+
+```text
+Daily_Summary_CDHW_Events.xlsx
+```
+
+The trajectory dataset contains event-level daily spatial information, including:
+
+```text
+Event ID
+Date
+Latitude
+Longitude
+```
+
+These daily coordinates are used to reconstruct individual CDHW migration paths.
+
+### Migration-Track Rasters
+
+Annual migration-track counts are stored as:
 
 ```text
 Migration_TrackCount_1982.tif
@@ -23,43 +48,67 @@ Migration_TrackCount_1983.tif
 Migration_TrackCount_2019.tif
 ```
 
-### `raw_data/population/`
-
-Copy the GPW 2000 GeoTIFF whose filename begins with:
+The annual rasters are aggregated into two equal 19-year periods:
 
 ```text
-gpw_v4_population_count_rev11_2000
+Early period  = 1982–2000
+Recent period = 2001–2019
 ```
 
-### `raw_data/landuse/`
+The spatial change layer is calculated as:
 
-Copy:
+```text
+Change = (2001–2019) − (1982–2000)
+```
+
+Positive values indicate increased migration-track occurrence during the recent period, whereas negative values indicate decreased occurrence.
+
+## Land-Use Context
+
+Cropland and pasture data for 2000 are used to summarize migration-track occurrence over agricultural land:
 
 ```text
 Cropland2000_5m.tif
 Pasture2000_5m.tif
 ```
 
-## Upload to GitHub
+These datasets are used for summary statistics only and are not displayed as background map layers.
 
-Upload the **contents of this folder to the root of one GitHub repository**.
+## Trajectory Visualization
 
-Then open:
+Migration trajectories are colored according to the start year of each event using eight temporal classes:
 
-**Settings → Pages → Source → GitHub Actions**
+```text
+1980–1985
+1985–1990
+1990–1995
+1995–2000
+2000–2005
+2005–2010
+2010–2015
+2015–2020
+```
 
-The included workflow `.github/workflows/deploy-pages.yml` automatically:
+Dateline-crossing trajectories are separated during preprocessing to prevent artificial lines across the global map.
 
-1. installs the Python dependencies;
-2. sums annual migration rasters for 1982–2000;
-3. sums annual migration rasters for 2001–2019;
-4. calculates recent minus early;
-5. prepares web display copies of population/cropland/pasture;
-6. generates `summary.json` and `annual_summary.csv`;
-7. deploys the finished dashboard to GitHub Pages.
+## Spatial Visualization
 
-## Important
+All numerical calculations are performed using the original migration-track grid.
 
-The GeoTIFF source data are **not bundled in this ZIP** because they are currently only on your local `D:` drive and were not uploaded to this ChatGPT conversation.
+For web visualization, cumulative and change rasters are bilinearly resampled to a finer display grid to improve visual continuity:
 
-Once those rasters are copied into `raw_data/`, the repository is designed to be uploaded directly to GitHub.
+```text
+Native migration grid
+        ↓
+Bilinear resampling
+        ↓
+Web-display raster
+```
+
+The interpolation is applied only for visualization and does not modify the underlying migration-track statistics.
+
+## Author
+
+**Amitesh Sabut**  
+Zachry Department of Civil and Environmental Engineering  
+Texas A&M University
