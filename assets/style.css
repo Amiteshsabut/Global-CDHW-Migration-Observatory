@@ -470,15 +470,7 @@ input[type="range"] {
 }
 
 .map-note {
-  margin-top: 9px;
-  background: #fff;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  padding: 9px 12px;
-  color: #5d6a76;
-  font-size: 10px;
-  line-height: 1.4;
-  box-shadow: var(--shadow);
+  display: none !important;
 }
 
 .leaflet-control-attribution { font-size: 8px; }
