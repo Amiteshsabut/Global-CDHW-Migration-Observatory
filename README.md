@@ -14,66 +14,6 @@ The interactive interface provides three complementary views:
 
 A draggable map divider enables direct comparison between the two observational periods.
 
-## Data
-
-The dashboard is based on observed CDHW event tracking for 1982–2019.
-
-### Migration Trajectories
-
-Daily event trajectories are derived from:
-
-```text
-Daily_Summary_CDHW_Events.xlsx
-```
-
-The trajectory dataset contains event-level daily spatial information, including:
-
-```text
-Event ID
-Date
-Latitude
-Longitude
-```
-
-These daily coordinates are used to reconstruct individual CDHW migration paths.
-
-### Migration-Track Rasters
-
-Annual migration-track counts are stored as:
-
-```text
-Migration_TrackCount_1982.tif
-Migration_TrackCount_1983.tif
-...
-Migration_TrackCount_2019.tif
-```
-
-The annual rasters are aggregated into two equal 19-year periods:
-
-```text
-Early period  = 1982–2000
-Recent period = 2001–2019
-```
-
-The spatial change layer is calculated as:
-
-```text
-Change = (2001–2019) − (1982–2000)
-```
-
-Positive values indicate increased migration-track occurrence during the recent period, whereas negative values indicate decreased occurrence.
-
-## Land-Use Context
-
-Cropland and pasture data for 2000 are used to summarize migration-track occurrence over agricultural land:
-
-```text
-Cropland2000_5m.tif
-Pasture2000_5m.tif
-```
-
-These datasets are used for summary statistics only and are not displayed as background map layers.
-
 ## Trajectory Visualization
 
 Migration trajectories are colored according to the start year of each event using eight temporal classes:
