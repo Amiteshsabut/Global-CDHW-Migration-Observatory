@@ -1,49 +1,65 @@
 # Global Compound Drought–Heatwave Migration Observatory
 
-An interactive web dashboard for exploring the spatial evolution of observed compound drought–heatwave (CDHW) migration events worldwide during 1982–2019.
+This repository is configured so that **GitHub itself preprocesses the GeoTIFFs and deploys the dashboard**. You do not need to run the preprocessing script on your computer.
 
-The dashboard compares two equal observational periods, **1982–2000** and **2001–2019**, and provides interactive views of migration trajectories, migration-track density, and changes in spatial occurrence.
+## Dashboard comparison
 
-## Dashboard
+- **Early period:** 1982–2000
+- **Recent period:** 2001–2019
+- **Change:** 2001–2019 minus 1982–2000
 
-The interactive interface provides three complementary views:
+The dashboard provides a draggable period-comparison map, a recent-minus-early change map, annual 1982–2019 trend, population/cropland/pasture context layers, opacity controls, continent zooms, and grid-cell inspection.
 
-- **Tracks** — observed CDHW migration trajectories reconstructed from daily event locations.
-- **Density** — cumulative migration-track occurrence during 1982–2000 and 2001–2019.
-- **Change** — spatial difference in migration-track occurrence between the recent and early periods.
+## Put your data in these three folders
 
-A draggable map divider enables direct comparison between the two observational periods.
+### `raw_data/migration/`
 
-## Trajectory Visualization
-
-Migration trajectories are colored according to the start year of each event using eight temporal classes:
+Copy:
 
 ```text
-1980–1985
-1985–1990
-1990–1995
-1995–2000
-2000–2005
-2005–2010
-2010–2015
-2015–2020
+Migration_TrackCount_1982.tif
+Migration_TrackCount_1983.tif
+...
+Migration_TrackCount_2019.tif
 ```
 
-Dateline-crossing trajectories are separated during preprocessing to prevent artificial lines across the global map.
+### `raw_data/population/`
 
-## Spatial Visualization
-
-All numerical calculations are performed using the original migration-track grid.
-
-For web visualization, cumulative and change rasters are bilinearly resampled to a finer display grid to improve visual continuity:
+Copy the GPW 2000 GeoTIFF whose filename begins with:
 
 ```text
-Native migration grid
-        ↓
-Bilinear resampling
-        ↓
-Web-display raster
+gpw_v4_population_count_rev11_2000
 ```
 
-The interpolation is applied only for visualization and does not modify the underlying migration-track statistics.
+### `raw_data/landuse/`
 
+Copy:
+
+```text
+Cropland2000_5m.tif
+Pasture2000_5m.tif
+```
+
+## Upload to GitHub
+
+Upload the **contents of this folder to the root of one GitHub repository**.
+
+Then open:
+
+**Settings → Pages → Source → GitHub Actions**
+
+The included workflow `.github/workflows/deploy-pages.yml` automatically:
+
+1. installs the Python dependencies;
+2. sums annual migration rasters for 1982–2000;
+3. sums annual migration rasters for 2001–2019;
+4. calculates recent minus early;
+5. prepares web display copies of population/cropland/pasture;
+6. generates `summary.json` and `annual_summary.csv`;
+7. deploys the finished dashboard to GitHub Pages.
+
+## Important
+
+The GeoTIFF source data are **not bundled in this ZIP** because they are currently only on your local `D:` drive and were not uploaded to this ChatGPT conversation.
+
+Once those rasters are copied into `raw_data/`, the repository is designed to be uploaded directly to GitHub.
