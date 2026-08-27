@@ -47,8 +47,3 @@ Web-display raster
 
 The interpolation is applied only for visualization and does not modify the underlying migration-track statistics.
 
-## Author
-
-**Amitesh Sabut**  
-Zachry Department of Civil and Environmental Engineering  
-Texas A&M University
