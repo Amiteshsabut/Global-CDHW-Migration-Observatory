@@ -1,99 +1,214 @@
 """
-Prepare web-ready rasters for the Global CDHW Migration Observatory.
+Prepare data for the revised Global CDHW Migration Observatory.
 
-This script:
-1) Reads annual Migration_TrackCount_YYYY.tif rasters for 1982-2019.
-2) Builds two equal 19-year cumulative maps:
-      1982-2000
-      2001-2019
-3) Builds a difference map: recent - early.
-4) Creates lightweight web rasters for population, cropland, and pasture.
-5) Writes summary.json and annual_summary.csv for the dashboard.
+Required raw files
+------------------
+raw_data/migration/
+    Migration_TrackCount_1982.tif ... Migration_TrackCount_2019.tif
 
-Edit only the PATHS section if your folders differ.
+raw_data/events/
+    Daily_Summary_CDHW_Events.xlsx
 
-Recommended environment:
-    conda create -n cdhw-dashboard python=3.11
-    conda activate cdhw-dashboard
-    pip install rasterio numpy pandas
+raw_data/landuse/
+    Cropland2000_5m.tif
+    Pasture2000_5m.tif
+
+Scientific handling
+-------------------
+- Event trajectories come directly from Daily_Summary_CDHW_Events.xlsx.
+- 1982–2000 and 2001–2019 raster statistics use the ORIGINAL annual raster grid.
+- Bilinear interpolation is used ONLY to make smoother web-display rasters.
+- Cropland and pasture are NOT plotted as map overlays.
+- Cropland/pasture are regridded to the native migration grid only for summary statistics.
+- Population is not used.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-import csv
 import json
-import math
-import shutil
-from typing import Dict, Tuple
+import re
 
 import numpy as np
+import pandas as pd
 import rasterio
 from rasterio.enums import Resampling
-from rasterio.warp import calculate_default_transform, reproject
+from rasterio.transform import from_origin
+from rasterio.warp import reproject
 
-
-# ============================================================
-# PATHS — repository-relative so GitHub Actions can run this
-# ============================================================
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 MIGRATION_DIR = REPO_ROOT / "raw_data" / "migration"
-POPULATION_DIR = REPO_ROOT / "raw_data" / "population"
+EVENT_FILE = REPO_ROOT / "raw_data" / "events" / "Daily_Summary_CDHW_Events.xlsx"
 
-CROPLAND_TIF = REPO_ROOT / "raw_data" / "landuse" / "Cropland2000_5m.tif"
-PASTURE_TIF = REPO_ROOT / "raw_data" / "landuse" / "Pasture2000_5m.tif"
-
-POPULATION_GLOB = "gpw_v4_population_count_rev11_2000*.tif"
+LANDUSE_DIR = REPO_ROOT / "raw_data" / "landuse"
+CROPLAND_TIF = LANDUSE_DIR / "Cropland2000_5m.tif"
+PASTURE_TIF = LANDUSE_DIR / "Pasture2000_5m.tif"
 
 OUTPUT_DIR = REPO_ROOT / "data"
 
-# Context rasters are downsampled for fast GitHub Pages viewing.
-# 0.25 degrees = ~25-30 km at the equator.
-WEB_CONTEXT_RESOLUTION_DEG = 0.25
+EARLY_YEARS = range(1982, 2001)
+RECENT_YEARS = range(2001, 2020)
+ALL_YEARS = range(1982, 2020)
 
-EARLY_YEARS = list(range(1982, 2001))
-RECENT_YEARS = list(range(2001, 2020))
-ALL_YEARS = EARLY_YEARS + RECENT_YEARS
+# Display only. Change to 0.125 for a smoother but larger web raster.
+DISPLAY_RES_DEG = 0.25
+
+# Leave None for automatic robust limits.
+# Example:
+# DENSITY_COLOR_MAX = 20
+# CHANGE_COLOR_ABS_MAX = 15
+DENSITY_COLOR_MAX = None
+CHANGE_COLOR_ABS_MAX = None
 
 NODATA = -9999.0
 
 
-def ensure_inputs() -> Tuple[Dict[int, Path], Path]:
-    if not MIGRATION_DIR.exists():
-        raise FileNotFoundError(f"Migration folder not found:\n{MIGRATION_DIR}")
+def find_column(df, candidates):
+    lookup = {str(c).strip().lower(): c for c in df.columns}
+    for candidate in candidates:
+        key = candidate.lower()
+        if key in lookup:
+            return lookup[key]
+    raise KeyError(
+        f"Could not find any of {candidates}. "
+        f"Available columns: {list(df.columns)}"
+    )
 
-    migration_files: Dict[int, Path] = {}
-    for path in MIGRATION_DIR.glob("Migration_TrackCount_*.tif"):
-        try:
-            year = int(path.stem.split("_")[-1])
-        except ValueError:
-            continue
-        migration_files[year] = path
 
-    missing = [y for y in ALL_YEARS if y not in migration_files]
+def load_events():
+    if not EVENT_FILE.exists():
+        raise FileNotFoundError(
+            f"Missing:\n{EVENT_FILE}\n\n"
+            "Create raw_data/events and upload Daily_Summary_CDHW_Events.xlsx."
+        )
+
+    df = pd.read_excel(EVENT_FILE)
+
+    c_date = find_column(df, ["Date", "date"])
+    c_event = find_column(df, ["Event ID", "Event_ID", "EventID", "event_id"])
+    c_lon = find_column(df, ["Longitude", "longitude", "Lon", "lon"])
+    c_lat = find_column(df, ["Latitude", "latitude", "Lat", "lat"])
+
+    out = df[[c_date, c_event, c_lon, c_lat]].copy()
+    out.columns = ["date", "event_id", "lon", "lat"]
+
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    out["lon"] = pd.to_numeric(out["lon"], errors="coerce")
+    out["lat"] = pd.to_numeric(out["lat"], errors="coerce")
+
+    out = out.dropna(subset=["date", "event_id", "lon", "lat"])
+    out["lon"] = ((out["lon"] + 180.0) % 360.0) - 180.0
+    out = out[(out["lat"] >= -90.0) & (out["lat"] <= 90.0)]
+    out["year"] = out["date"].dt.year
+
+    return out
+
+
+def split_dateline(coords):
+    if len(coords) <= 1:
+        return [coords]
+
+    parts = [[coords[0]]]
+
+    for prev, cur in zip(coords[:-1], coords[1:]):
+        if abs(cur[0] - prev[0]) > 180:
+            parts.append([cur])
+        else:
+            parts[-1].append(cur)
+
+    return [part for part in parts if part]
+
+
+def build_tracks_geojson(events):
+    features = []
+
+    for event_id, g in events.groupby("event_id", sort=False):
+        g = g.sort_values("date")
+
+        start_year = int(g["date"].iloc[0].year)
+        end_year = int(g["date"].iloc[-1].year)
+
+        coords = list(zip(g["lon"].astype(float), g["lat"].astype(float)))
+
+        for segment_index, part in enumerate(split_dateline(coords)):
+            if len(part) == 1:
+                geometry = {
+                    "type": "Point",
+                    "coordinates": [float(part[0][0]), float(part[0][1])],
+                }
+            else:
+                geometry = {
+                    "type": "LineString",
+                    "coordinates": [
+                        [float(x), float(y)] for x, y in part
+                    ],
+                }
+
+            features.append({
+                "type": "Feature",
+                "properties": {
+                    "event_id": str(event_id),
+                    "segment": segment_index,
+                    "start_year": start_year,
+                    "end_year": end_year,
+                    "start_date": g["date"].iloc[0].strftime("%Y-%m-%d"),
+                    "end_date": g["date"].iloc[-1].strftime("%Y-%m-%d"),
+                },
+                "geometry": geometry,
+            })
+
+    geojson = {
+        "type": "FeatureCollection",
+        "features": features,
+    }
+
+    with (OUTPUT_DIR / "tracks.geojson").open("w", encoding="utf-8") as f:
+        json.dump(geojson, f)
+
+    starts = (
+        events.sort_values("date")
+        .groupby("event_id", as_index=False)
+        .first()[["event_id", "date"]]
+    )
+    starts["year"] = starts["date"].dt.year
+
+    annual = [
+        {
+            "year": year,
+            "events": int((starts["year"] == year).sum()),
+        }
+        for year in ALL_YEARS
+    ]
+
+    return {
+        "early_count": int(starts["year"].between(1982, 2000).sum()),
+        "recent_count": int(starts["year"].between(2001, 2019).sum()),
+        "annual": annual,
+    }
+
+
+def find_migration_files():
+    files = {}
+
+    for p in MIGRATION_DIR.glob("Migration_TrackCount_*.tif"):
+        m = re.search(r"(\d{4})$", p.stem)
+        if m:
+            files[int(m.group(1))] = p
+
+    missing = [year for year in ALL_YEARS if year not in files]
+
     if missing:
         raise FileNotFoundError(
-            "Missing annual migration rasters for years: " + ", ".join(map(str, missing))
+            "Missing annual migration rasters: "
+            + ", ".join(map(str, missing))
         )
 
-    pop_candidates = sorted(POPULATION_DIR.glob(POPULATION_GLOB))
-    if not pop_candidates:
-        raise FileNotFoundError(
-            f"No population GeoTIFF matching {POPULATION_GLOB!r} found in:\n"
-            f"{POPULATION_DIR}"
-        )
-    population_tif = pop_candidates[0]
-
-    for p, label in [(CROPLAND_TIF, "Cropland"), (PASTURE_TIF, "Pasture")]:
-        if not p.exists():
-            raise FileNotFoundError(f"{label} GeoTIFF not found:\n{p}")
-
-    return migration_files, population_tif
+    return files
 
 
-def read_single_band(path: Path):
+def read_raster(path):
     with rasterio.open(path) as src:
         arr = src.read(1).astype("float64")
         profile = src.profile.copy()
@@ -102,363 +217,372 @@ def read_single_band(path: Path):
         nodata = src.nodata
 
     valid = np.isfinite(arr)
+
     if nodata is not None and np.isfinite(nodata):
         valid &= arr != nodata
 
     arr = np.where(valid, arr, np.nan)
+
     return arr, profile, transform, crs
 
 
-def verify_grid(reference, other, year: int):
-    ref_profile, ref_transform, ref_crs = reference
-    profile, transform, crs = other
+def check_same_grid(reference, current, year):
+    rp, rt, rc = reference
+    p, t, c = current
 
-    keys = ("width", "height")
-    for key in keys:
-        if ref_profile[key] != profile[key]:
-            raise ValueError(
-                f"Grid mismatch in {year}: {key} "
-                f"{profile[key]} != reference {ref_profile[key]}"
-            )
+    if p["width"] != rp["width"] or p["height"] != rp["height"]:
+        raise ValueError(f"Raster dimensions differ in {year}.")
 
-    if transform != ref_transform:
-        raise ValueError(f"Transform mismatch in annual migration raster {year}.")
-    if crs != ref_crs:
-        raise ValueError(f"CRS mismatch in annual migration raster {year}.")
+    if t != rt:
+        raise ValueError(f"Raster transform differs in {year}.")
+
+    if c != rc:
+        raise ValueError(f"Raster CRS differs in {year}.")
 
 
-def summarize_array(arr: np.ndarray):
-    valid = np.isfinite(arr)
-    vals = arr[valid]
-    positive = vals[vals > 0]
+def stats(arr):
+    vals = arr[np.isfinite(arr)]
+
+    if vals.size == 0:
+        return {
+            "sum": 0.0,
+            "mean": 0.0,
+            "max": 0.0,
+            "positive_cells": 0,
+        }
 
     return {
-        "sum": float(np.nansum(vals)) if vals.size else 0.0,
-        "mean": float(np.nanmean(vals)) if vals.size else 0.0,
-        "max": float(np.nanmax(vals)) if vals.size else 0.0,
-        "positive_cells": int(positive.size),
-        "valid_cells": int(vals.size),
+        "sum": float(vals.sum()),
+        "mean": float(vals.mean()),
+        "max": float(vals.max()),
+        "positive_cells": int((vals > 0).sum()),
     }
 
 
-def write_float_geotiff(
-    out_path: Path,
-    array: np.ndarray,
-    reference_profile: dict,
-    transform,
-    crs,
-):
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    out = np.where(np.isfinite(array), array, NODATA).astype("float32")
-
-    profile = reference_profile.copy()
-    profile.update(
-        driver="GTiff",
-        dtype="float32",
-        count=1,
-        nodata=NODATA,
-        compress="DEFLATE",
-        predictor=2,
-        BIGTIFF="IF_SAFER",
-        transform=transform,
-        crs=crs,
-    )
-
-    # Tiling is valuable for medium/large rasters but can be invalid for very
-    # small grids. Only enable it when both dimensions are at least 256 px.
-    if profile["width"] >= 256 and profile["height"] >= 256:
-        profile.update(
-            tiled=True,
-            blockxsize=256,
-            blockysize=256,
-        )
-    else:
-        profile.pop("tiled", None)
-        profile.pop("blockxsize", None)
-        profile.pop("blockysize", None)
-
-    with rasterio.open(out_path, "w", **profile) as dst:
-        dst.write(out, 1)
-
-
-def build_migration_products(migration_files: Dict[int, Path]):
-    annual_rows = []
-    early_stack = []
-    recent_stack = []
-
-    reference_profile = None
-    reference_transform = None
-    reference_crs = None
+def build_period_rasters(files):
+    early = []
+    recent = []
+    reference = None
 
     for year in ALL_YEARS:
-        path = migration_files[year]
-        arr, profile, transform, crs = read_single_band(path)
+        arr, profile, transform, crs = read_raster(files[year])
 
-        if reference_profile is None:
-            reference_profile = profile
-            reference_transform = transform
-            reference_crs = crs
+        if reference is None:
+            reference = (profile, transform, crs)
         else:
-            verify_grid(
-                (reference_profile, reference_transform, reference_crs),
+            check_same_grid(
+                reference,
                 (profile, transform, crs),
                 year,
             )
 
-        stats = summarize_array(arr)
-        annual_rows.append({"year": year, **stats})
-
-        if year in EARLY_YEARS:
-            early_stack.append(arr)
+        if year <= 2000:
+            early.append(arr)
         else:
-            recent_stack.append(arr)
+            recent.append(arr)
 
-    early = np.nansum(np.stack(early_stack, axis=0), axis=0)
-    recent = np.nansum(np.stack(recent_stack, axis=0), axis=0)
+    early_stack = np.stack(early)
+    recent_stack = np.stack(recent)
 
-    # Preserve pixels that are missing for every year within each period.
-    early_all_missing = np.all(~np.isfinite(np.stack(early_stack, axis=0)), axis=0)
-    recent_all_missing = np.all(~np.isfinite(np.stack(recent_stack, axis=0)), axis=0)
-    early[early_all_missing] = np.nan
-    recent[recent_all_missing] = np.nan
+    early_sum = np.nansum(early_stack, axis=0)
+    recent_sum = np.nansum(recent_stack, axis=0)
 
-    change = recent - early
+    early_sum[np.all(~np.isfinite(early_stack), axis=0)] = np.nan
+    recent_sum[np.all(~np.isfinite(recent_stack), axis=0)] = np.nan
 
-    early_file = OUTPUT_DIR / "migration_1982_2000.tif"
-    recent_file = OUTPUT_DIR / "migration_2001_2019.tif"
-    change_file = OUTPUT_DIR / "migration_change_recent_minus_early.tif"
-
-    write_float_geotiff(
-        early_file, early, reference_profile, reference_transform, reference_crs
-    )
-    write_float_geotiff(
-        recent_file, recent, reference_profile, reference_transform, reference_crs
-    )
-    write_float_geotiff(
-        change_file, change, reference_profile, reference_transform, reference_crs
-    )
-
-    early_stats = summarize_array(early)
-    recent_stats = summarize_array(recent)
-    change_stats = summarize_array(change)
-
-    pooled = np.concatenate([
-        early[np.isfinite(early) & (early > 0)].ravel(),
-        recent[np.isfinite(recent) & (recent > 0)].ravel(),
-    ])
-    if pooled.size:
-        migration_color_max = float(np.nanpercentile(pooled, 99))
-        if migration_color_max <= 0:
-            migration_color_max = float(np.nanmax(pooled))
-    else:
-        migration_color_max = 1.0
-
-    abs_change = np.abs(change[np.isfinite(change)])
-    if abs_change.size:
-        change_color_abs_max = float(np.nanpercentile(abs_change, 99))
-        if change_color_abs_max <= 0:
-            change_color_abs_max = float(np.nanmax(abs_change))
-    else:
-        change_color_abs_max = 1.0
+    change = recent_sum - early_sum
 
     return {
-        "annual_rows": annual_rows,
-        "early_stats": early_stats,
-        "recent_stats": recent_stats,
-        "change_stats": change_stats,
-        "migration_color_max": migration_color_max,
-        "change_color_abs_max": change_color_abs_max,
+        "early": early_sum,
+        "recent": recent_sum,
+        "change": change,
+        "profile": reference[0],
+        "transform": reference[1],
+        "crs": reference[2],
     }
 
 
-def reproject_context(
-    source_path: Path,
-    output_path: Path,
-    resampling: Resampling,
-):
-    """
-    Reproject/downsample context raster to EPSG:4326 for fast browser rendering.
+def display_grid():
+    width = int(round(360.0 / DISPLAY_RES_DEG))
+    height = int(round(180.0 / DISPLAY_RES_DEG))
+    transform = from_origin(
+        -180.0,
+        90.0,
+        DISPLAY_RES_DEG,
+        DISPLAY_RES_DEG,
+    )
+    return transform, width, height
 
-    Population uses Resampling.sum because values are counts.
-    Cropland/pasture use Resampling.average because the 5 arc-minute maps are
-    normally interpreted as fractional/continuous land-use surfaces.
-    """
-    with rasterio.open(source_path) as src:
-        if src.crs is None:
-            raise ValueError(f"Raster has no CRS: {source_path}")
 
-        transform, width, height = calculate_default_transform(
-            src.crs,
-            "EPSG:4326",
-            src.width,
-            src.height,
-            *src.bounds,
-            resolution=WEB_CONTEXT_RESOLUTION_DEG,
-        )
+def reproject_for_display(src_array, src_transform, src_crs):
+    dst_transform, width, height = display_grid()
 
-        dst_array = np.full((height, width), NODATA, dtype="float32")
+    dst = np.full(
+        (height, width),
+        NODATA,
+        dtype="float32",
+    )
 
+    src = np.where(
+        np.isfinite(src_array),
+        src_array,
+        NODATA,
+    ).astype("float32")
+
+    reproject(
+        source=src,
+        destination=dst,
+        src_transform=src_transform,
+        src_crs=src_crs,
+        src_nodata=NODATA,
+        dst_transform=dst_transform,
+        dst_crs="EPSG:4326",
+        dst_nodata=NODATA,
+        resampling=Resampling.bilinear,
+    )
+
+    dst = np.where(dst == NODATA, np.nan, dst)
+
+    return dst, dst_transform
+
+
+def write_display_tif(path, array, transform):
+    arr = np.where(
+        np.isfinite(array),
+        array,
+        NODATA,
+    ).astype("float32")
+
+    profile = {
+        "driver": "GTiff",
+        "height": arr.shape[0],
+        "width": arr.shape[1],
+        "count": 1,
+        "dtype": "float32",
+        "crs": "EPSG:4326",
+        "transform": transform,
+        "nodata": NODATA,
+        "compress": "DEFLATE",
+        "predictor": 2,
+        "tiled": True,
+        "blockxsize": 256,
+        "blockysize": 256,
+    }
+
+    with rasterio.open(path, "w", **profile) as dst:
+        dst.write(arr, 1)
+
+
+def regrid_landuse_to_native(path, dst_shape, dst_transform, dst_crs):
+    if not path.exists():
+        raise FileNotFoundError(f"Missing land-use file:\n{path}")
+
+    dst = np.full(
+        dst_shape,
+        NODATA,
+        dtype="float32",
+    )
+
+    with rasterio.open(path) as src:
         reproject(
             source=rasterio.band(src, 1),
-            destination=dst_array,
+            destination=dst,
             src_transform=src.transform,
             src_crs=src.crs,
             src_nodata=src.nodata,
-            dst_transform=transform,
-            dst_crs="EPSG:4326",
+            dst_transform=dst_transform,
+            dst_crs=dst_crs,
             dst_nodata=NODATA,
-            resampling=resampling,
+            resampling=Resampling.average,
         )
 
-        profile = src.profile.copy()
-        profile.update(
-            width=width,
-            height=height,
-            transform=transform,
-            crs="EPSG:4326",
-            dtype="float32",
-            count=1,
-            nodata=NODATA,
-        )
+    return np.where(dst == NODATA, np.nan, dst).astype("float64")
 
-    array = np.where(dst_array == NODATA, np.nan, dst_array).astype("float64")
-    write_float_geotiff(output_path, array, profile, transform, "EPSG:4326")
 
-    valid = array[np.isfinite(array)]
-    if valid.size:
-        vmin = float(np.nanpercentile(valid, 1))
-        vmax = float(np.nanpercentile(valid, 99))
-    else:
-        vmin, vmax = 0.0, 1.0
+def summarize_landuse(track, weights):
+    valid = (
+        np.isfinite(track)
+        & np.isfinite(weights)
+        & (weights > 0)
+    )
+
+    if not valid.any():
+        return {
+            "weighted_mean": 0.0,
+            "overlap_pct": 0.0,
+        }
+
+    t = track[valid]
+    w = weights[valid]
+
+    denom = float(w.sum())
+
+    weighted_mean = (
+        float(np.sum(t * w) / denom)
+        if denom > 0
+        else 0.0
+    )
+
+    overlap_pct = (
+        float(100.0 * w[t > 0].sum() / denom)
+        if denom > 0
+        else 0.0
+    )
 
     return {
-        "min": float(np.nanmin(valid)) if valid.size else 0.0,
-        "max": float(np.nanmax(valid)) if valid.size else 0.0,
-        "display_min": vmin,
-        "display_max": vmax,
+        "weighted_mean": weighted_mean,
+        "overlap_pct": overlap_pct,
     }
 
 
-def write_annual_csv(rows):
-    out = OUTPUT_DIR / "annual_summary.csv"
-    fieldnames = ["year", "sum", "mean", "max", "positive_cells", "valid_cells"]
-    with out.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
+def robust_limits(early, recent, change):
+    positive = np.concatenate([
+        early[np.isfinite(early) & (early > 0)],
+        recent[np.isfinite(recent) & (recent > 0)],
+    ])
 
+    if DENSITY_COLOR_MAX is not None:
+        density_max = float(DENSITY_COLOR_MAX)
+    elif positive.size:
+        density_max = float(np.nanpercentile(positive, 99))
+    else:
+        density_max = 1.0
 
-def web_path(path: Path) -> str:
-    # index.html is at repository root, so web files are referenced as data/...
-    return "data/" + path.name
+    absolute_change = np.abs(change[np.isfinite(change)])
+
+    if CHANGE_COLOR_ABS_MAX is not None:
+        change_max = float(CHANGE_COLOR_ABS_MAX)
+    elif absolute_change.size:
+        change_max = float(np.nanpercentile(absolute_change, 99))
+    else:
+        change_max = 1.0
+
+    return max(density_max, 1e-9), max(change_max, 1e-9)
 
 
 def main():
-    print("=" * 72)
-    print("Global CDHW Migration Observatory — data preparation")
-    print("=" * 72)
-
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    migration_files, population_tif = ensure_inputs()
 
-    print(f"Migration rasters: {len(migration_files)} years")
-    print(f"Population raster: {population_tif.name}")
-    print(f"Cropland raster:   {CROPLAND_TIF.name}")
-    print(f"Pasture raster:    {PASTURE_TIF.name}")
+    print("1/5 Reading Daily_Summary_CDHW_Events.xlsx...")
+    events = load_events()
+    event_summary = build_tracks_geojson(events)
 
-    print("\n[1/4] Building 1982-2000 and 2001-2019 migration products...")
-    migration = build_migration_products(migration_files)
+    print("2/5 Building native 1982-2000 and 2001-2019 migration rasters...")
+    files = find_migration_files()
+    native = build_period_rasters(files)
 
-    print("[2/4] Preparing population context raster...")
-    pop_out = OUTPUT_DIR / "population_2000_web.tif"
-    pop_stats = reproject_context(
-        population_tif, pop_out, Resampling.sum
+    print("3/5 Making smooth web-display rasters...")
+    early_display, display_transform = reproject_for_display(
+        native["early"],
+        native["transform"],
+        native["crs"],
+    )
+    recent_display, _ = reproject_for_display(
+        native["recent"],
+        native["transform"],
+        native["crs"],
+    )
+    change_display, _ = reproject_for_display(
+        native["change"],
+        native["transform"],
+        native["crs"],
     )
 
-    print("[3/4] Preparing cropland and pasture context rasters...")
-    crop_out = OUTPUT_DIR / "cropland_2000_web.tif"
-    pasture_out = OUTPUT_DIR / "pasture_2000_web.tif"
-
-    crop_stats = reproject_context(
-        CROPLAND_TIF, crop_out, Resampling.average
+    write_display_tif(
+        OUTPUT_DIR / "density_1982_2000_display.tif",
+        early_display,
+        display_transform,
     )
-    pasture_stats = reproject_context(
-        PASTURE_TIF, pasture_out, Resampling.average
+    write_display_tif(
+        OUTPUT_DIR / "density_2001_2019_display.tif",
+        recent_display,
+        display_transform,
+    )
+    write_display_tif(
+        OUTPUT_DIR / "change_2001_2019_minus_1982_2000_display.tif",
+        change_display,
+        display_transform,
     )
 
-    print("[4/4] Writing summary.json and annual_summary.csv...")
-    write_annual_csv(migration["annual_rows"])
+    print("4/5 Calculating cropland/pasture summaries...")
+    crop = regrid_landuse_to_native(
+        CROPLAND_TIF,
+        native["early"].shape,
+        native["transform"],
+        native["crs"],
+    )
+    pasture = regrid_landuse_to_native(
+        PASTURE_TIF,
+        native["early"].shape,
+        native["transform"],
+        native["crs"],
+    )
 
+    crop_early = summarize_landuse(native["early"], crop)
+    crop_recent = summarize_landuse(native["recent"], crop)
+
+    pasture_early = summarize_landuse(native["early"], pasture)
+    pasture_recent = summarize_landuse(native["recent"], pasture)
+
+    density_max, change_max = robust_limits(
+        native["early"],
+        native["recent"],
+        native["change"],
+    )
+
+    print("5/5 Writing summary.json...")
     summary = {
-        "project": {
-            "title": "Global Compound Drought–Heatwave Migration Observatory",
-            "observation_period": "1982–2019",
-            "description": (
-                "Observed cumulative migration-track counts compared across "
-                "two equal 19-year windows."
-            ),
-        },
         "periods": {
-            "early": {
-                "label": "1982–2000",
-                "years": EARLY_YEARS,
-                "file": "data/migration_1982_2000.tif",
-                "stats": migration["early_stats"],
-            },
-            "recent": {
-                "label": "2001–2019",
-                "years": RECENT_YEARS,
-                "file": "data/migration_2001_2019.tif",
-                "stats": migration["recent_stats"],
-            },
+            "early": "1982–2000",
+            "recent": "2001–2019",
         },
-        "change": {
-            "label": "2001–2019 minus 1982–2000",
-            "file": "data/migration_change_recent_minus_early.tif",
-            "stats": migration["change_stats"],
+        "events": event_summary,
+        "native_stats": {
+            "early": stats(native["early"]),
+            "recent": stats(native["recent"]),
+            "change": stats(native["change"]),
         },
-        "display": {
-            "migration_color_max": migration["migration_color_max"],
-            "change_color_abs_max": migration["change_color_abs_max"],
-        },
-        "context": {
-            "population": {
-                "label": "Population count (2000)",
-                "file": web_path(pop_out),
-                "transform": "log1p",
-                **pop_stats,
-            },
+        "landuse": {
             "cropland": {
-                "label": "Cropland (2000)",
-                "file": web_path(crop_out),
-                "transform": "linear",
-                **crop_stats,
+                "early_weighted_mean": crop_early["weighted_mean"],
+                "recent_weighted_mean": crop_recent["weighted_mean"],
+                "early_overlap_pct": crop_early["overlap_pct"],
+                "recent_overlap_pct": crop_recent["overlap_pct"],
             },
             "pasture": {
-                "label": "Pasture (2000)",
-                "file": web_path(pasture_out),
-                "transform": "linear",
-                **pasture_stats,
+                "early_weighted_mean": pasture_early["weighted_mean"],
+                "recent_weighted_mean": pasture_recent["weighted_mean"],
+                "early_overlap_pct": pasture_early["overlap_pct"],
+                "recent_overlap_pct": pasture_recent["overlap_pct"],
             },
         },
-        "annual": migration["annual_rows"],
+        "display": {
+            "density_color_max": density_max,
+            "change_color_abs_max": change_max,
+            "display_resolution_deg": DISPLAY_RES_DEG,
+            "interpolation": "bilinear display only",
+        },
+        "files": {
+            "early_density": "data/density_1982_2000_display.tif",
+            "recent_density": "data/density_2001_2019_display.tif",
+            "change_density": "data/change_2001_2019_minus_1982_2000_display.tif",
+            "tracks": "data/tracks.geojson",
+        },
     }
 
     with (OUTPUT_DIR / "summary.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
-    print("\nDONE.")
-    print(f"Dashboard data written to:\n{OUTPUT_DIR}")
-    print("\nFiles created:")
-    for p in sorted(OUTPUT_DIR.iterdir()):
-        if p.is_file():
-            print(f"  - {p.name} ({p.stat().st_size / 1024:.1f} KB)")
+    pd.DataFrame(event_summary["annual"]).to_csv(
+        OUTPUT_DIR / "annual_event_counts.csv",
+        index=False,
+    )
 
-    print("\nNext:")
-    print("  1) From the dashboard folder run: python -m http.server 8000")
-    print("  2) Open: http://localhost:8000")
-    print("  3) Commit this repository to GitHub and enable GitHub Pages.")
+    print("\nDONE")
+    print("Early events:", event_summary["early_count"])
+    print("Recent events:", event_summary["recent_count"])
+    print("Density color max:", density_max)
+    print("Change color abs max:", change_max)
 
 
 if __name__ == "__main__":
