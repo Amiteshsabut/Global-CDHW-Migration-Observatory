@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="description" content="Global Compound Drought–Heatwave Migration Observatory" />
+  <title>Global CDHW Migration Observatory</title>
+
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="assets/style.css" />
+</head>
+
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark">CDHW</div>
+      <div>
+        <h1>Global Compound Drought–Heatwave Migration Observatory</h1>
+        <p>Observed migration-track patterns, 1982–2019</p>
+      </div>
+    </div>
+    <div class="top-actions">
+      <button id="btnResetView" class="button button-ghost">Reset map</button>
+      <a id="btnDownloadSummary" class="button button-solid" href="data/annual_summary.csv" download>
+        Download summary
+      </a>
+    </div>
+  </header>
+
+  <main class="dashboard">
+    <aside class="sidebar">
+
+      <section class="panel">
+        <div class="panel-title">
+          <span>WHERE</span>
+          <small>Map extent</small>
+        </div>
+
+        <div class="choice-row">
+          <label class="radio-pill">
+            <input type="radio" name="extentMode" value="global" checked />
+            <span>Global</span>
+          </label>
+          <label class="radio-pill">
+            <input type="radio" name="extentMode" value="region" />
+            <span>Region</span>
+          </label>
+        </div>
+
+        <label class="field-label" for="regionSelect">Region</label>
+        <select id="regionSelect" class="select" disabled>
+          <option value="Global">Global</option>
+          <option value="North America">North America</option>
+          <option value="South America">South America</option>
+          <option value="Europe">Europe</option>
+          <option value="Africa">Africa</option>
+          <option value="Asia">Asia</option>
+          <option value="Oceania">Oceania</option>
+        </select>
+      </section>
+
+      <section class="panel">
+        <div class="panel-title">
+          <span>WHEN</span>
+          <small>Equal 19-year windows</small>
+        </div>
+
+        <div class="period-grid">
+          <div class="period-card">
+            <strong>Early</strong>
+            <span>1982–2000</span>
+          </div>
+          <div class="period-arrow">→</div>
+          <div class="period-card">
+            <strong>Recent</strong>
+            <span>2001–2019</span>
+          </div>
+        </div>
+
+        <div class="mode-switch" role="group" aria-label="Map mode">
+          <button class="mode-btn active" data-mode="compare">Compare</button>
+          <button class="mode-btn" data-mode="change">Change</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-title">
+          <span>WHAT</span>
+          <small>Layers and display</small>
+        </div>
+
+        <label class="field-label" for="contextSelect">Context layer</label>
+        <select id="contextSelect" class="select">
+          <option value="none">None</option>
+          <option value="population">Population (2000)</option>
+          <option value="cropland">Cropland (2000)</option>
+          <option value="pasture">Pasture (2000)</option>
+        </select>
+
+        <div class="slider-group">
+          <div class="slider-header">
+            <label for="migrationOpacity">Migration opacity</label>
+            <span id="migrationOpacityValue">85%</span>
+          </div>
+          <input id="migrationOpacity" type="range" min="20" max="100" value="85" />
+        </div>
+
+        <div class="slider-group">
+          <div class="slider-header">
+            <label for="contextOpacity">Context opacity</label>
+            <span id="contextOpacityValue">35%</span>
+          </div>
+          <input id="contextOpacity" type="range" min="0" max="80" value="35" />
+        </div>
+
+        <label class="check-row">
+          <input id="showBasemap" type="checkbox" checked />
+          <span>Show basemap</span>
+        </label>
+      </section>
+
+      <section class="panel summary-panel">
+        <div class="panel-title">
+          <span>SUMMARY</span>
+          <small>Cumulative cell-track counts</small>
+        </div>
+        <div class="stats-grid">
+          <div class="stat">
+            <div class="stat-kicker">1982–2000</div>
+            <div id="statEarlyTotal" class="stat-value">—</div>
+            <div class="stat-label">total track count</div>
+          </div>
+          <div class="stat">
+            <div class="stat-kicker">2001–2019</div>
+            <div id="statRecentTotal" class="stat-value">—</div>
+            <div class="stat-label">total track count</div>
+          </div>
+          <div class="stat">
+            <div class="stat-kicker">Change</div>
+            <div id="statChangePct" class="stat-value">—</div>
+            <div class="stat-label">relative change</div>
+          </div>
+          <div class="stat">
+            <div class="stat-kicker">Recent peak</div>
+            <div id="statRecentMax" class="stat-value">—</div>
+            <div class="stat-label">max grid-cell count</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel chart-panel">
+        <div class="panel-title">
+          <span>ANNUAL TREND</span>
+          <small>1982–2019</small>
+        </div>
+        <div class="chart-wrap">
+          <canvas id="annualChart" aria-label="Annual migration-track count chart"></canvas>
+        </div>
+      </section>
+    </aside>
+
+    <section class="map-column">
+      <div class="map-toolbar">
+        <div>
+          <strong id="mapModeTitle">Period comparison</strong>
+          <span id="mapModeSubtitle">Drag the divider to compare 1982–2000 with 2001–2019.</span>
+        </div>
+        <div id="mapStatus" class="status-badge">Loading data…</div>
+      </div>
+
+      <div id="mapShell" class="map-shell">
+        <div id="mapLeft" class="map-layer"></div>
+        <div id="mapRight" class="map-layer map-right"></div>
+
+        <div id="leftPeriodLabel" class="period-label period-label-left">
+          1982–2000
+        </div>
+        <div id="rightPeriodLabel" class="period-label period-label-right">
+          2001–2019
+        </div>
+
+        <div id="divider" class="divider" aria-label="Comparison divider">
+          <div class="divider-handle">↔</div>
+        </div>
+
+        <div id="mapReadout" class="map-readout">
+          <span>Move over the map</span>
+        </div>
+
+        <div id="legend" class="legend">
+          <div class="legend-title">Cumulative track count</div>
+          <div class="legend-ramp"></div>
+          <div class="legend-values">
+            <span>0</span>
+            <span id="legendMax">—</span>
+          </div>
+        </div>
+
+        <div id="contextLegend" class="legend context-legend hidden">
+          <div id="contextLegendTitle" class="legend-title">Context</div>
+          <div class="context-ramp"></div>
+          <div class="legend-values">
+            <span>low</span>
+            <span>high</span>
+          </div>
+        </div>
+      </div>
+
+      <footer class="map-footer">
+        <div>
+          <strong>Interpretation:</strong>
+          period rasters are cumulative migration-track counts over each 19-year window.
+          Use the same color scale for both periods.
+        </div>
+        <div class="footer-note">
+          Click the map to inspect a grid-cell value.
+        </div>
+      </footer>
+    </section>
+  </main>
+
+  <div id="toast" class="toast hidden" role="status"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/georaster"></script>
+  <script src="https://unpkg.com/georaster-layer-for-leaflet"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+  <script src="assets/app.js"></script>
+</body>
+</html>
