@@ -1,4 +1,4 @@
-# Global Compound Drought–Heatwave Migration Observatory
+# Global Compound Drought–Heatwave Migration
 
 An interactive web dashboard for exploring the spatial evolution of observed compound drought–heatwave (CDHW) migration events worldwide during 1982–2019.
 
