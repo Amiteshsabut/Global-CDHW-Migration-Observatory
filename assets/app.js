@@ -560,7 +560,7 @@ function renderView() {
     document.getElementById(
       "mapNoteText"
     ).textContent =
-      "Tracks come directly from Daily_Summary_CDHW_Events.xlsx. Colors represent event start year. Dateline crossings are split to avoid false trans-global lines.";
+      "Tracks use minimized event trajectories containing only start year and ordered centroid coordinates. Colors represent event start year. Dateline crossings are split to avoid false trans-global lines.";
 
     renderTracks();
   }
@@ -779,20 +779,23 @@ function makeDailyPointLayer(features) {
 
   features.forEach(
     feature => {
-      if (
-        feature.geometry.type !==
-        "LineString"
-      ) {
-        return;
-      }
+      const geometry = feature.geometry;
+      const lines =
+        geometry.type === "LineString"
+          ? [geometry.coordinates]
+          : geometry.type === "MultiLineString"
+            ? geometry.coordinates
+            : geometry.type === "Point"
+              ? [[geometry.coordinates]]
+              : [];
 
       const color =
         yearColor(
           feature.properties.start_year
         );
 
-      feature.geometry.coordinates.forEach(
-        ([lon, lat]) => {
+      lines.forEach(
+        line => line.forEach(([lon, lat]) => {
           L.circleMarker(
             [lat, lon],
             {
@@ -807,7 +810,7 @@ function makeDailyPointLayer(features) {
                 )
             }
           ).addTo(group);
-        }
+        })
       );
     }
   );

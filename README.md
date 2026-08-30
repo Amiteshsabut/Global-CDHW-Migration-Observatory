@@ -31,6 +31,27 @@ Migration trajectories are colored according to the start year of each event usi
 
 Dateline-crossing trajectories are separated during preprocessing to prevent artificial lines across the global map.
 
+## Public trajectory data
+
+The public repository uses `raw_data/events/tracks.geojson`. Each GeoJSON
+feature represents one event and contains only:
+
+- `start_year`
+- ordered centroid coordinates in a `LineString` or `MultiLineString`
+
+Exact dates, event identifiers, duration, severity, and voxel attributes are
+not published. The detailed Excel workbook should remain outside the public
+repository.
+
+To recreate the minimized file locally, run:
+
+```bash
+python scripts/create_public_tracks.py "path/to/Daily_Summary_CDHW_Events.xlsx"
+```
+
+This writes `raw_data/events/tracks.geojson`. The normal GitHub Actions build
+then validates and copies that minimized file into the deployed dashboard.
+
 ## Spatial Visualization
 
 All numerical calculations are performed using the original migration-track grid.

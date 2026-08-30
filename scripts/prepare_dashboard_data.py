@@ -7,7 +7,7 @@ raw_data/migration/
     Migration_TrackCount_1982.tif ... Migration_TrackCount_2019.tif
 
 raw_data/events/
-    Daily_Summary_CDHW_Events.xlsx
+    tracks.geojson
 
 raw_data/landuse/
     Cropland2000_5m.tif
@@ -15,7 +15,8 @@ raw_data/landuse/
 
 Scientific handling
 -------------------
-- Event trajectories come directly from Daily_Summary_CDHW_Events.xlsx.
+- Event trajectories come from a public, minimized GeoJSON containing only
+  each event's start year and its ordered centroid coordinates.
 - 1982–2000 and 2001–2019 raster statistics use the ORIGINAL annual raster grid.
 - Bilinear interpolation is used ONLY to make smoother web-display rasters.
 - Cropland and pasture are NOT plotted as map overlays.
@@ -26,11 +27,11 @@ Scientific handling
 from __future__ import annotations
 
 from pathlib import Path
+import csv
 import json
 import re
 
 import numpy as np
-import pandas as pd
 import rasterio
 from rasterio.enums import Resampling
 from rasterio.transform import from_origin
@@ -40,7 +41,7 @@ from rasterio.warp import reproject
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 MIGRATION_DIR = REPO_ROOT / "raw_data" / "migration"
-EVENT_FILE = REPO_ROOT / "raw_data" / "events" / "Daily_Summary_CDHW_Events.xlsx"
+PUBLIC_TRACKS_FILE = REPO_ROOT / "raw_data" / "events" / "tracks.geojson"
 
 LANDUSE_DIR = REPO_ROOT / "raw_data" / "landuse"
 CROPLAND_TIF = LANDUSE_DIR / "Cropland2000_5m.tif"
@@ -65,99 +66,123 @@ CHANGE_COLOR_ABS_MAX = None
 NODATA = -9999.0
 
 
-def find_column(df, candidates):
-    lookup = {str(c).strip().lower(): c for c in df.columns}
-    for candidate in candidates:
-        key = candidate.lower()
-        if key in lookup:
-            return lookup[key]
-    raise KeyError(
-        f"Could not find any of {candidates}. "
-        f"Available columns: {list(df.columns)}"
-    )
-
-
-def load_events():
-    if not EVENT_FILE.exists():
-        raise FileNotFoundError(
-            f"Missing:\n{EVENT_FILE}\n\n"
-            "Create raw_data/events and upload Daily_Summary_CDHW_Events.xlsx."
+def normalize_position(position, feature_number):
+    if not isinstance(position, list) or len(position) < 2:
+        raise ValueError(
+            f"Feature {feature_number} contains an invalid coordinate."
         )
 
-    df = pd.read_excel(EVENT_FILE)
+    try:
+        lon = float(position[0])
+        lat = float(position[1])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Feature {feature_number} contains a nonnumeric coordinate."
+        ) from exc
 
-    c_date = find_column(df, ["Date", "date"])
-    c_event = find_column(df, ["Event ID", "Event_ID", "EventID", "event_id"])
-    c_lon = find_column(df, ["Longitude", "longitude", "Lon", "lon"])
-    c_lat = find_column(df, ["Latitude", "latitude", "Lat", "lat"])
+    if not np.isfinite(lon) or not np.isfinite(lat):
+        raise ValueError(
+            f"Feature {feature_number} contains a nonfinite coordinate."
+        )
 
-    out = df[[c_date, c_event, c_lon, c_lat]].copy()
-    out.columns = ["date", "event_id", "lon", "lat"]
+    if not -180.0 <= lon <= 180.0 or not -90.0 <= lat <= 90.0:
+        raise ValueError(
+            f"Feature {feature_number} contains a coordinate outside "
+            "valid longitude/latitude bounds."
+        )
 
-    out["date"] = pd.to_datetime(out["date"], errors="coerce")
-    out["lon"] = pd.to_numeric(out["lon"], errors="coerce")
-    out["lat"] = pd.to_numeric(out["lat"], errors="coerce")
-
-    out = out.dropna(subset=["date", "event_id", "lon", "lat"])
-    out["lon"] = ((out["lon"] + 180.0) % 360.0) - 180.0
-    out = out[(out["lat"] >= -90.0) & (out["lat"] <= 90.0)]
-    out["year"] = out["date"].dt.year
-
-    return out
-
-
-def split_dateline(coords):
-    if len(coords) <= 1:
-        return [coords]
-
-    parts = [[coords[0]]]
-
-    for prev, cur in zip(coords[:-1], coords[1:]):
-        if abs(cur[0] - prev[0]) > 180:
-            parts.append([cur])
-        else:
-            parts[-1].append(cur)
-
-    return [part for part in parts if part]
+    return [lon, lat]
 
 
-def build_tracks_geojson(events):
+def normalize_geometry(geometry, feature_number):
+    if not isinstance(geometry, dict):
+        raise ValueError(f"Feature {feature_number} has no valid geometry.")
+
+    geometry_type = geometry.get("type")
+    coordinates = geometry.get("coordinates")
+
+    if geometry_type == "Point":
+        normalized = normalize_position(coordinates, feature_number)
+    elif geometry_type == "LineString":
+        if not isinstance(coordinates, list) or len(coordinates) < 2:
+            raise ValueError(
+                f"Feature {feature_number} has an invalid LineString."
+            )
+        normalized = [
+            normalize_position(position, feature_number)
+            for position in coordinates
+        ]
+    elif geometry_type == "MultiLineString":
+        if not isinstance(coordinates, list) or not coordinates:
+            raise ValueError(
+                f"Feature {feature_number} has an invalid MultiLineString."
+            )
+        normalized = []
+        for line in coordinates:
+            if not isinstance(line, list) or len(line) < 2:
+                raise ValueError(
+                    f"Feature {feature_number} has an invalid line segment."
+                )
+            normalized.append([
+                normalize_position(position, feature_number)
+                for position in line
+            ])
+    else:
+        raise ValueError(
+            f"Feature {feature_number} uses unsupported geometry "
+            f"{geometry_type!r}."
+        )
+
+    return {
+        "type": geometry_type,
+        "coordinates": normalized,
+    }
+
+
+def load_public_tracks():
+    if not PUBLIC_TRACKS_FILE.exists():
+        raise FileNotFoundError(
+            f"Missing:\n{PUBLIC_TRACKS_FILE}\n\n"
+            "Upload the minimized public tracks.geojson file to "
+            "raw_data/events/."
+        )
+
+    with PUBLIC_TRACKS_FILE.open("r", encoding="utf-8") as f:
+        source = json.load(f)
+
+    if source.get("type") != "FeatureCollection":
+        raise ValueError("tracks.geojson must be a GeoJSON FeatureCollection.")
+
     features = []
+    start_years = []
 
-    for event_id, g in events.groupby("event_id", sort=False):
-        g = g.sort_values("date")
+    for feature_number, feature in enumerate(source.get("features", []), start=1):
+        properties = feature.get("properties") or {}
+        try:
+            start_year = int(properties["start_year"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Feature {feature_number} has no valid start_year."
+            ) from exc
 
-        start_year = int(g["date"].iloc[0].year)
-        end_year = int(g["date"].iloc[-1].year)
+        if start_year not in ALL_YEARS:
+            raise ValueError(
+                f"Feature {feature_number} has start_year {start_year}; "
+                "expected 1982 through 2019."
+            )
 
-        coords = list(zip(g["lon"].astype(float), g["lat"].astype(float)))
+        features.append({
+            "type": "Feature",
+            "properties": {"start_year": start_year},
+            "geometry": normalize_geometry(
+                feature.get("geometry"),
+                feature_number,
+            ),
+        })
+        start_years.append(start_year)
 
-        for segment_index, part in enumerate(split_dateline(coords)):
-            if len(part) == 1:
-                geometry = {
-                    "type": "Point",
-                    "coordinates": [float(part[0][0]), float(part[0][1])],
-                }
-            else:
-                geometry = {
-                    "type": "LineString",
-                    "coordinates": [
-                        [float(x), float(y)] for x, y in part
-                    ],
-                }
-
-            features.append({
-                "type": "Feature",
-                "properties": {
-                    "event_id": str(event_id),
-                    "segment": segment_index,
-                    "start_year": start_year,
-                    "end_year": end_year,
-                    "start_date": g["date"].iloc[0].strftime("%Y-%m-%d"),
-                    "end_date": g["date"].iloc[-1].strftime("%Y-%m-%d"),
-                },
-                "geometry": geometry,
-            })
+    if not features:
+        raise ValueError("tracks.geojson contains no track features.")
 
     geojson = {
         "type": "FeatureCollection",
@@ -165,26 +190,19 @@ def build_tracks_geojson(events):
     }
 
     with (OUTPUT_DIR / "tracks.geojson").open("w", encoding="utf-8") as f:
-        json.dump(geojson, f)
-
-    starts = (
-        events.sort_values("date")
-        .groupby("event_id", as_index=False)
-        .first()[["event_id", "date"]]
-    )
-    starts["year"] = starts["date"].dt.year
+        json.dump(geojson, f, separators=(",", ":"))
 
     annual = [
         {
             "year": year,
-            "events": int((starts["year"] == year).sum()),
+            "events": start_years.count(year),
         }
         for year in ALL_YEARS
     ]
 
     return {
-        "early_count": int(starts["year"].between(1982, 2000).sum()),
-        "recent_count": int(starts["year"].between(2001, 2019).sum()),
+        "early_count": sum(year <= 2000 for year in start_years),
+        "recent_count": sum(year >= 2001 for year in start_years),
         "annual": annual,
     }
 
@@ -463,9 +481,8 @@ def robust_limits(early, recent, change):
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    print("1/5 Reading Daily_Summary_CDHW_Events.xlsx...")
-    events = load_events()
-    event_summary = build_tracks_geojson(events)
+    print("1/5 Reading minimized public tracks.geojson...")
+    event_summary = load_public_tracks()
 
     print("2/5 Building native 1982-2000 and 2001-2019 migration rasters...")
     files = find_migration_files()
@@ -573,10 +590,12 @@ def main():
     with (OUTPUT_DIR / "summary.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
-    pd.DataFrame(event_summary["annual"]).to_csv(
-        OUTPUT_DIR / "annual_event_counts.csv",
-        index=False,
-    )
+    with (OUTPUT_DIR / "annual_event_counts.csv").open(
+        "w", encoding="utf-8", newline=""
+    ) as f:
+        writer = csv.DictWriter(f, fieldnames=["year", "events"])
+        writer.writeheader()
+        writer.writerows(event_summary["annual"])
 
     print("\nDONE")
     print("Early events:", event_summary["early_count"])
